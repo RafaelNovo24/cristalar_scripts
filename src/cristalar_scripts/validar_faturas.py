@@ -1,4 +1,4 @@
-"""Fill the website invoice form from an Excel file.
+"""Fill the PC Plus invoice form from an Excel file.
 
 Dry-run mode: fills the fields and takes a screenshot, never submits.
 Usage: python -m cristalar_scripts.validar_faturas [faturas.xlsx]
@@ -14,18 +14,32 @@ from openpyxl import load_workbook
 from playwright.sync_api import sync_playwright
 
 # ---------------------------------------------------------------------------
-# SELECTORS - replace with the real HTML elements of the site.
-# Any Playwright selector works (CSS, "text=...", "#id", etc).
+# SELECTORS - the HTML elements of the site, all in one place.
 # ---------------------------------------------------------------------------
 SELECTORS = {
-    "login_user": "#Email",                             # email field
-    "login_password": "#Password",                      # password field
-    "login_submit": "input[type='submit'][value='Entrar']",  # "Entrar" button
-    "new_invoice": "a[href='/Invoices/Create']",     # "Nova Fatura" button
-    "field_client": "input[name='client']",      # client field of the form
-    "field_value": "input[name='value']",        # value field of the form
-    # "submit": ...  <- add when we move past dry-run
+    # Login page (/Account/Login).
+    "login_email_input": "#Email",
+    "login_password_input": "#Password",
+    "login_entrar_button": "input[type='submit'][value='Entrar']",
+    # Home page toolbar.
+    "nova_fatura_button": "a[href='/Invoices/Create']",
+    # "Tipo de fatura" radio group. The real radio is invisible (iCheck draws
+    # its own control on top), so we click the helper overlay instead.
+    "tipo_fatura_radio": "#fatura + ins.iCheck-helper",
+    # select2 comboboxes: "Cliente" and, in the Items section, "Artigo".
+    "cliente_dropdown": "#select2-cliente-container",
+    "artigo_dropdown": "#select2-produto-container",
+    "dropdown_search_input": "input.select2-search__field",
+    # Suggestions of the open dropdown. The "Sem resultados" line is also an
+    # <li class="select2-results__option">, but it carries no aria-selected,
+    # so requiring that attribute keeps only the real, clickable suggestions.
+    "dropdown_options": "li.select2-results__option[aria-selected]",
+    "valor_input": "",  # TODO: value field of the item, selector still unknown
 }
+
+# Item line used in every invoice. The dropdown also holds
+# "Prestacao de Servico de Limpeza- ES", so the match must be exact.
+ARTIGO = "Prestação de Serviço de Limpeza"
 
 # Site address - always the same, so it lives here and not in .env.
 HOME_URL = "http://www.pcplusonline.pt/Home/Index"
@@ -45,6 +59,14 @@ SCREENSHOTS_DIR = Path("screenshots")
 
 # Visible browser so we can follow the filling.
 HEADLESS = False
+
+# How long to wait for a dropdown to filter its suggestions (milliseconds).
+DROPDOWN_WAIT_MS = 2000
+
+
+def log_step(message):
+    """Print what the script is doing on the page, under the invoice line."""
+    print(f"    - {message}")
 
 
 def read_invoices(path):
@@ -68,47 +90,119 @@ def get_credentials():
     return user, password
 
 
-def needs_login(page):
+def is_on_login_page(page):
     """True when the site redirected us to the login page."""
     # Going to HOME_URL without a valid session lands on
     # /Account/Login?ReturnUrl=%2fHome%2fIndex, so the URL is enough to tell.
     return LOGIN_PATH.lower() in page.url.lower()
 
 
-def login(page):
-    """Log in with the credentials and save the session to STATE_FILE."""
+def submit_login_form(page):
+    """Fill Email/Password, press Entrar and save the session to STATE_FILE."""
     user, password = get_credentials()
-    page.fill(SELECTORS["login_user"], user)
-    page.fill(SELECTORS["login_password"], password)
-    page.click(SELECTORS["login_submit"])
-    # Wait for the post-login navigation to settle.
+    page.fill(SELECTORS["login_email_input"], user)
+    page.fill(SELECTORS["login_password_input"], password)
+    page.click(SELECTORS["login_entrar_button"])
     page.wait_for_load_state("networkidle")
-    # The login form sends us back to ReturnUrl (the home page); if we are
-    # still on the login page the credentials were refused.
-    if LOGIN_PATH.lower() in page.url.lower():
+    # The login sends us back to ReturnUrl (the home page); still being on the
+    # login page means the credentials were refused.
+    if is_on_login_page(page):
         raise RuntimeError("Login failed: still on the login page.")
-    # Keep the session so the next runs skip the login.
     page.context.storage_state(path=STATE_FILE)
     print("Logged in, session saved.")
 
 
-def open_new_invoice(page):
-    """Click the "Nova Fatura" button to open the invoice form."""
-    page.click(SELECTORS["new_invoice"])
+def click_nova_fatura_button(page):
+    """Go to the home page and press Nova Fatura to open an empty form."""
+    page.goto(HOME_URL)
+    page.click(SELECTORS["nova_fatura_button"])
     page.wait_for_load_state("networkidle")
+    log_step("opened the Nova Fatura form")
 
 
-def fill_invoice(page, client, value, index):
-    """Fill client and value and save a screenshot. Does not submit."""
-    page.fill(SELECTORS["field_client"], client)
-    page.fill(SELECTORS["field_value"], f"{value:.2f}")
+def check_tipo_fatura_radio(page):
+    """Tick the Fatura option of the Tipo de fatura radio group."""
+    page.click(SELECTORS["tipo_fatura_radio"])
+    log_step("ticked Tipo de fatura = Fatura")
+
+
+def search_in_dropdown(page, dropdown, text):
+    """Open a select2 dropdown, type text and return the suggestions locator.
+
+    The text is typed key by key: select2 only filters on real keyboard
+    events, so setting the value directly would leave the full list on screen.
+    """
+    page.click(dropdown)
+    page.keyboard.type(text, delay=30)
+    page.wait_for_timeout(DROPDOWN_WAIT_MS)
+    return page.locator(SELECTORS["dropdown_options"])
+
+
+def select_cliente(page, client):
+    """Pick the client in the Cliente dropdown by typing its name.
+
+    Returns True when exactly one suggestion matched and was selected.
+    Returns False (with a warning) on zero matches (client does not exist) or
+    on several matches (the name is too vague to know which one is meant).
+    """
+    options = search_in_dropdown(page, SELECTORS["cliente_dropdown"], client)
+    count = options.count()
+
+    if count == 0:
+        print(f"  WARNING: no client found for '{client}', skipped.")
+        return False
+    if count > 1:
+        names = ", ".join(options.nth(i).inner_text() for i in range(min(count, 5)))
+        print(f"  WARNING: {count} clients match '{client}' ({names} ...), "
+              "name is not specific enough, skipped.")
+        return False
+
+    options.first.click()
+    log_step(f"selected Cliente = {client}")
+    return True
+
+
+def select_artigo(page):
+    """Pick the fixed item (ARTIGO) in the Artigo dropdown of the Items table."""
+    options = search_in_dropdown(page, SELECTORS["artigo_dropdown"], ARTIGO)
+    # Typing the full name also matches "... - ES", so take the suggestion
+    # whose text is exactly ARTIGO.
+    for index in range(options.count()):
+        option = options.nth(index)
+        if option.inner_text().strip() == ARTIGO:
+            option.click()
+            log_step(f"selected Artigo = {ARTIGO}")
+            return
+    raise RuntimeError(f"item '{ARTIGO}' not found in the Artigo dropdown")
+
+
+def fill_invoice(context, client, value, index):
+    """Fill one invoice in its own tab. True when filled, False when skipped."""
+    # One tab per client, all in the same browser window.
+    page = context.new_page()
+    click_nova_fatura_button(page)
+    check_tipo_fatura_radio(page)
+
+    if not select_cliente(page, client):
+        page.close()  # nothing to review in this tab
+        return False
+
+    select_artigo(page)
+
+    # The value field selector is not known yet; skip it until we have it.
+    if SELECTORS["valor_input"]:
+        page.fill(SELECTORS["valor_input"], f"{value:.2f}")
+        log_step(f"filled valor = {value:.2f}")
 
     SCREENSHOTS_DIR.mkdir(exist_ok=True)
     safe_name = "".join(c if c.isalnum() else "_" for c in client)
-    page.screenshot(path=SCREENSHOTS_DIR / f"{index:03d}-{safe_name}.png")
+    shot = SCREENSHOTS_DIR / f"{index:03d}-{safe_name}.png"
+    page.screenshot(path=shot)
+    log_step(f"screenshot saved to {shot}")
 
-    # DRY-RUN: page.click(SELECTORS["submit"]) plus the wait for the success
+    # DRY-RUN: the click on the submit button and the wait for the success
     # message would go here once we want to submit for real.
+    return True
 
 
 def main() -> None:
@@ -120,6 +214,7 @@ def main() -> None:
     print(f"{len(invoices)} invoice(s) read from {path}")
 
     done = 0
+    skipped = 0
     failed = 0
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS)
@@ -130,33 +225,34 @@ def main() -> None:
         else:
             context = browser.new_context()
 
-        page = context.new_page()
-        page.goto(HOME_URL)
-
-        # The site may already have us logged in (saved session or an active
-        # one), so only log in when the login form actually shows up.
-        if needs_login(page):
-            login(page)
+        # First tab only checks the session; each invoice gets its own tab.
+        login_page = context.new_page()
+        login_page.goto(HOME_URL)
+        if is_on_login_page(login_page):
+            submit_login_form(login_page)
         else:
             print("Already logged in.")
-
-        # Open the invoice form.
-        open_new_invoice(page)
+        login_page.close()
 
         for index, (client, value) in enumerate(invoices, start=1):
+            print(f"[{index}] {client} - {value:.2f}")
             # One bad invoice must not stop the remaining ones.
             try:
-                fill_invoice(page, client, value, index)
-                print(f"[{index}] OK     {client} - {value:.2f}")
-                done += 1
+                if fill_invoice(context, client, value, index):
+                    done += 1
+                else:
+                    skipped += 1
             except Exception as error:  # noqa: BLE001 - keep going
-                print(f"[{index}] FAILED {client} - {error}")
+                print(f"  FAILED: {error}")
                 failed += 1
 
+        # Keep the filled tabs on screen so they can be reviewed before the
+        # window closes.
+        input("Press Enter to close the browser...")
         context.close()
         browser.close()
 
-    print(f"End (dry-run): {done} filled, {failed} failed")
+    print(f"End (dry-run): {done} filled, {skipped} skipped, {failed} failed")
     if failed:
         sys.exit(1)
 
