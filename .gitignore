@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# cristalar scripts
+.env
+auth.json
+screenshots/
+faturas.xlsx
