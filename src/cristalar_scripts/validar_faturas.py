@@ -34,7 +34,12 @@ SELECTORS = {
     # <li class="select2-results__option">, but it carries no aria-selected,
     # so requiring that attribute keeps only the real, clickable suggestions.
     "dropdown_options": "li.select2-results__option[aria-selected]",
-    "valor_input": "",  # TODO: value field of the item, selector still unknown
+    # Items section: "Adicionar" creates the item line, which then shows the
+    # "Preço Unitário" box. Its id carries a random GUID, so we go by class.
+    "adicionar_item_button": "#add-line",
+    "unit_price_input": "div.product_total input.product_price",
+    # Toolbar button that closes and issues the invoice.
+    "finalizar_button": "button[value='Finalizar']",
 }
 
 # Item line used in every invoice. The dropdown also holds
@@ -62,6 +67,13 @@ HEADLESS = False
 
 # How long to wait for a dropdown to filter its suggestions (milliseconds).
 DROPDOWN_WAIT_MS = 2000
+
+# How long to wait for the item line to appear after "Adicionar" (ms).
+ITEM_LINE_WAIT_MS = 2000
+
+# Press "Finalizar" at the end. False keeps the run a dry-run: the invoice is
+# filled and left open, nothing is issued. Set to True to really submit.
+SUBMIT = False
 
 
 def log_step(message):
@@ -176,6 +188,37 @@ def select_artigo(page):
     raise RuntimeError(f"item '{ARTIGO}' not found in the Artigo dropdown")
 
 
+def click_adicionar_item_button(page):
+    """Press "Adicionar" to create the item line with the price boxes."""
+    page.click(SELECTORS["adicionar_item_button"])
+    # The line is added by JavaScript, so wait for the price box to show up.
+    page.wait_for_selector(SELECTORS["unit_price_input"],
+                           timeout=ITEM_LINE_WAIT_MS + 5000)
+    page.wait_for_timeout(ITEM_LINE_WAIT_MS)
+    log_step("clicked Adicionar, item line created")
+
+
+def fill_preco_unitario(page, value):
+    """Write the amount in the "Preço Unitário" box of the last item line."""
+    # The site uses the Portuguese decimal separator (the box starts at
+    # "0,0000"), so send the value with a comma.
+    amount = f"{value:.2f}".replace(".", ",")
+    price_box = page.locator(SELECTORS["unit_price_input"]).last
+    price_box.fill(amount)
+    # The line total is only recalculated when the box loses focus, so leave
+    # it with Tab instead of jumping straight to the next step.
+    price_box.press("Tab")
+    page.wait_for_timeout(500)
+    log_step(f"filled Preço Unitário = {amount}")
+
+
+def click_finalizar_button(page):
+    """Press "Finalizar" to close and issue the invoice."""
+    page.click(SELECTORS["finalizar_button"])
+    page.wait_for_load_state("networkidle")
+    log_step("clicked Finalizar, invoice submitted")
+
+
 def fill_invoice(context, client, value, index):
     """Fill one invoice in its own tab. True when filled, False when skipped."""
     # One tab per client, all in the same browser window.
@@ -188,11 +231,8 @@ def fill_invoice(context, client, value, index):
         return False
 
     select_artigo(page)
-
-    # The value field selector is not known yet; skip it until we have it.
-    if SELECTORS["valor_input"]:
-        page.fill(SELECTORS["valor_input"], f"{value:.2f}")
-        log_step(f"filled valor = {value:.2f}")
+    click_adicionar_item_button(page)
+    fill_preco_unitario(page, value)
 
     SCREENSHOTS_DIR.mkdir(exist_ok=True)
     safe_name = "".join(c if c.isalnum() else "_" for c in client)
@@ -200,8 +240,12 @@ def fill_invoice(context, client, value, index):
     page.screenshot(path=shot)
     log_step(f"screenshot saved to {shot}")
 
-    # DRY-RUN: the click on the submit button and the wait for the success
-    # message would go here once we want to submit for real.
+    # The screenshot above is taken before Finalizar, so a dry-run leaves a
+    # record of exactly what would have been submitted.
+    if SUBMIT:
+        click_finalizar_button(page)
+    else:
+        log_step("dry-run: Finalizar not pressed")
     return True
 
 
@@ -252,7 +296,8 @@ def main() -> None:
         context.close()
         browser.close()
 
-    print(f"End (dry-run): {done} filled, {skipped} skipped, {failed} failed")
+    mode = "submitted" if SUBMIT else "dry-run"
+    print(f"End ({mode}): {done} filled, {skipped} skipped, {failed} failed")
     if failed:
         sys.exit(1)
 
