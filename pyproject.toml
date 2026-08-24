@@ -11,11 +11,14 @@ dependencies = [
     "playwright>=1.49",
     "openpyxl>=3.1",
     "python-dotenv>=1.0",
+    "streamlit>=1.40",
+    "platformdirs>=4.0",
 ]
 
 [project.scripts]
 cristalar-faturas = "cristalar_scripts.validar_faturas:main"
 cristalar-template = "cristalar_scripts.criar_template:main"
+cristalar-ui = "cristalar_scripts.streamlit_app:cli"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]

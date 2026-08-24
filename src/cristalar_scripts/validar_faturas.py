@@ -16,6 +16,9 @@ from dotenv import load_dotenv
 from openpyxl import load_workbook
 from playwright.async_api import async_playwright
 
+from cristalar_scripts import paths
+from cristalar_scripts.browser_setup import ensure_chromium
+
 # ---------------------------------------------------------------------------
 # SELECTORS - the HTML elements of the site, all in one place.
 # ---------------------------------------------------------------------------
@@ -57,13 +60,6 @@ LOGIN_PATH = "/Account/Login"
 
 # Excel file used when no argument is given.
 DEFAULT_EXCEL = "faturas.xlsx"
-
-# Saved browser session (cookies + local storage). While this file exists we
-# skip the login step, so we only log in once. Delete it to log in again.
-STATE_FILE = Path("auth.json")
-
-# Folder holding one screenshot per filled invoice.
-SCREENSHOTS_DIR = Path("screenshots")
 
 # Visible browser so we can follow the filling.
 HEADLESS = False
@@ -111,9 +107,9 @@ def is_on_login_page(page):
     return LOGIN_PATH.lower() in page.url.lower()
 
 
-async def submit_login_form(page):
+async def submit_login_form(page, credentials):
     """Fill Email/Password, press Entrar and save the session to STATE_FILE."""
-    user, password = get_credentials()
+    user, password = credentials
     await page.fill(SELECTORS["login_email_input"], user)
     await page.fill(SELECTORS["login_password_input"], password)
     await page.click(SELECTORS["login_entrar_button"])
@@ -122,7 +118,8 @@ async def submit_login_form(page):
     # login page means the credentials were refused.
     if is_on_login_page(page):
         raise RuntimeError("Login failed: still on the login page.")
-    await page.context.storage_state(path=STATE_FILE)
+    paths.ensure_data_dir()
+    await page.context.storage_state(path=paths.STATE_FILE)
     print("Logged in, session saved.")
 
 
@@ -222,10 +219,10 @@ async def click_finalizar_button(page, steps):
     steps.append("clicked Finalizar, invoice submitted")
 
 
-async def fill_invoice(context, client, value, index, slots):
+async def fill_invoice(context, client, value, index, slots, submit, on_event=None):
     """Fill one invoice in its own tab. True when filled, False when skipped.
 
-    The steps of this invoice are collected in a list and printed together at
+    The steps of this invoice are collected in a list and reported together at
     the end, so the tabs running side by side do not mix up their output.
     """
     steps = []
@@ -242,15 +239,9 @@ async def fill_invoice(context, client, value, index, slots):
                 await click_adicionar_item_button(page, steps)
                 await fill_preco_unitario(page, value, steps)
 
-                SCREENSHOTS_DIR.mkdir(exist_ok=True)
-                safe_name = "".join(c if c.isalnum() else "_" for c in client)
-                shot = SCREENSHOTS_DIR / f"{index:03d}-{safe_name}.png"
-                await page.screenshot(path=shot)
-                steps.append(f"screenshot saved to {shot}")
-
-                # The screenshot above is taken before Finalizar, so a dry-run
-                # leaves a record of what would have been submitted.
-                if SUBMIT:
+                # The form is left open at this point, whether or not it gets
+                # submitted, so it can be reviewed in its own tab.
+                if submit:
                     await click_finalizar_button(page, steps)
                 else:
                     steps.append("dry-run: Finalizar not pressed")
@@ -261,43 +252,87 @@ async def fill_invoice(context, client, value, index, slots):
             steps.append(f"FAILED: {error}")
             result = None
 
-    print(f"[{index}] {client} - {value:.2f}")
-    for step in steps:
-        print(f"    - {step}")
+    if on_event is not None:
+        on_event({
+            "index": index,
+            "client": client,
+            "value": value,
+            "steps": steps,
+            "result": result,
+        })
     return result
 
 
-async def run(invoices):
-    """Log in once, then fill every invoice in its own tab, all at once."""
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=HEADLESS)
+def print_event(event):
+    """Report one fill_invoice event in the CLI's step-by-step format."""
+    print(f"[{event['index']}] {event['client']} - {event['value']:.2f}")
+    for step in event["steps"]:
+        print(f"    - {step}")
+
+
+class InvoiceSession:
+    """A logged-in browser session that can fill invoices across several calls.
+
+    Splitting start/fill/close (instead of one function wrapped in a single
+    "with" block) lets the browser stay open after the invoices are filled,
+    so a caller such as the Streamlit UI can leave it up for review and close
+    it later, from a different call, on its own event loop thread.
+    """
+
+    def __init__(self):
+        self._playwright = None
+        self._browser = None
+        self._context = None
+
+    async def start(self, credentials, headless=HEADLESS, on_event=None):
+        """Launch the browser and make sure we are logged in."""
+        on_line = (lambda line: on_event({"log": line})) if on_event else None
+
+        self._playwright = await async_playwright().start()
+        await ensure_chromium(self._playwright, on_line)
+        self._browser = await self._playwright.chromium.launch(headless=headless)
 
         # Reuse the saved session when we have one.
-        if STATE_FILE.exists():
-            context = await browser.new_context(storage_state=STATE_FILE)
+        if paths.STATE_FILE.exists():
+            self._context = await self._browser.new_context(
+                storage_state=paths.STATE_FILE)
         else:
-            context = await browser.new_context()
+            self._context = await self._browser.new_context()
 
-        # First tab only checks the session; each invoice gets its own tab.
-        login_page = await context.new_page()
+        login_page = await self._context.new_page()
         await login_page.goto(HOME_URL)
         if is_on_login_page(login_page):
-            await submit_login_form(login_page)
-        else:
-            print("Already logged in.")
+            await submit_login_form(login_page, credentials)
+        elif on_line is not None:
+            on_line("Already logged in.")
         await login_page.close()
 
-        slots = asyncio.Semaphore(PARALLEL_TABS)
-        results = await asyncio.gather(*[
-            fill_invoice(context, client, value, index, slots)
+    async def fill(self, invoices, submit=SUBMIT, parallel_tabs=PARALLEL_TABS,
+                   on_event=None):
+        """Fill every invoice in its own tab, all at once. Returns the results."""
+        slots = asyncio.Semaphore(parallel_tabs)
+        return await asyncio.gather(*[
+            fill_invoice(self._context, client, value, index, slots, submit, on_event)
             for index, (client, value) in enumerate(invoices, start=1)
         ])
 
-        # Keep the filled tabs on screen so they can be reviewed before the
-        # window closes.
-        input("Press Enter to close the browser...")
-        await context.close()
-        await browser.close()
+    async def close(self):
+        """Close the browser and stop Playwright."""
+        await self._context.close()
+        await self._browser.close()
+        await self._playwright.stop()
+
+
+async def run(invoices, credentials):
+    """Log in once, fill every invoice, then wait before closing the browser."""
+    session = InvoiceSession()
+    await session.start(credentials, on_event=lambda e: print(e.get("log", "")))
+    results = await session.fill(invoices, on_event=print_event)
+
+    # Keep the filled tabs on screen so they can be reviewed before the
+    # window closes.
+    input("Press Enter to close the browser...")
+    await session.close()
     return results
 
 
@@ -309,7 +344,8 @@ def main() -> None:
     invoices = read_invoices(path)
     print(f"{len(invoices)} invoice(s) read from {path}")
 
-    results = asyncio.run(run(invoices))
+    credentials = get_credentials()
+    results = asyncio.run(run(invoices, credentials))
     done = results.count(True)
     skipped = results.count(False)
     failed = results.count(None)

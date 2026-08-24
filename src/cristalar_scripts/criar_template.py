@@ -1,5 +1,6 @@
 """Create the Excel template used to fill in the invoices."""
 
+from io import BytesIO
 from pathlib import Path
 
 from openpyxl import Workbook
@@ -12,13 +13,8 @@ TEMPLATE = "faturas.xlsx"
 COLUMNS = ["cliente", "valor"]
 
 
-def main() -> None:
-    """Write faturas.xlsx with the header row and one example row."""
-    target = Path(TEMPLATE)
-    if target.exists():
-        print(f"{target} already exists, nothing changed.")
-        return
-
+def build_template() -> Workbook:
+    """Build the workbook with the header row and one example row."""
     wb = Workbook()
     ws = wb.active
     ws.title = "faturas"
@@ -36,7 +32,24 @@ def main() -> None:
     ws.column_dimensions["A"].width = 30
     ws.column_dimensions["B"].width = 12
 
-    wb.save(target)
+    return wb
+
+
+def template_bytes() -> bytes:
+    """Return the template workbook as bytes, for a download button."""
+    buffer = BytesIO()
+    build_template().save(buffer)
+    return buffer.getvalue()
+
+
+def main() -> None:
+    """Write faturas.xlsx with the header row and one example row."""
+    target = Path(TEMPLATE)
+    if target.exists():
+        print(f"{target} already exists, nothing changed.")
+        return
+
+    build_template().save(target)
     print(f"Template created: {target}")
 
 
