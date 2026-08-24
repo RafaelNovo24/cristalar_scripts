@@ -26,15 +26,16 @@ def _run_invoices(state, invoices, credentials, headless, submit, parallel_tabs)
     if state.faturas_runner is None:
         state.faturas_runner = AsyncRunner()
     runner = state.faturas_runner
+    session = state.faturas_session
 
     async def work():
-        if state.faturas_session is None:
+        nonlocal session
+        if session is None:
             session = vf.InvoiceSession()
             await session.start(
                 credentials, headless=headless,
                 on_event=lambda e: events.put(("log", e.get("log", ""))))
-            state.faturas_session = session
-        return await state.faturas_session.fill(
+        return await session.fill(
             invoices, submit=submit, parallel_tabs=parallel_tabs,
             on_event=lambda e: events.put(("invoice", e)))
 
@@ -75,6 +76,8 @@ def _run_invoices(state, invoices, credentials, headless, submit, parallel_tabs)
             status.update(label="Failed", state="error")
             st.error(str(error))
             return None
+        finally:
+            state.faturas_session = session
 
         status.update(label="Done", state="complete")
     return results
