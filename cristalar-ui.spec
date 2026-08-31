@@ -18,6 +18,7 @@ datas += [("src/cristalar_scripts/streamlit_app.py", "cristalar_scripts")]
 hiddenimports = []
 hiddenimports += collect_submodules("streamlit")
 hiddenimports += collect_submodules("cristalar_scripts")
+hiddenimports += ["playwright.__main__"]
 
 a = Analysis(
     ["src/cristalar_scripts/launcher.py"],

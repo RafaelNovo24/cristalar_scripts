@@ -18,8 +18,17 @@ async def chromium_missing(playwright) -> bool:
 
 async def install_chromium(on_line=None) -> None:
     """Run ``playwright install chromium``, streaming its output line by line."""
+    if getattr(sys, "frozen", False):
+        # sys.executable is this exe in a frozen build, not a python
+        # interpreter, so "-m playwright" would just relaunch the whole app.
+        from cristalar_scripts.launcher import INSTALL_CHROMIUM_FLAG
+
+        argv = [sys.executable, INSTALL_CHROMIUM_FLAG]
+    else:
+        argv = [sys.executable, "-m", "playwright", "install", "chromium"]
+
     process = await asyncio.create_subprocess_exec(
-        sys.executable, "-m", "playwright", "install", "chromium",
+        *argv,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
