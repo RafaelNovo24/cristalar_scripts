@@ -83,6 +83,19 @@ C:\Users\<you>\AppData\Local\cristalar_scripts\auth.json
 
 Delete that file to force a fresh login.
 
+## Building a standalone .exe
+
+For a machine without `uv`, build a single-file executable instead:
+
+```powershell
+uv sync --group dev
+uv run pyinstaller cristalar-ui.spec --noconfirm
+```
+
+This produces `dist\cristalar-ui.exe` (~115 MB, self-contained). Double-click
+it, or run it from a terminal with `cristalar-ui.exe --port N`, and it opens
+the same web page in the default browser automatically.
+
 ## Updating and removing
 
 ```powershell
