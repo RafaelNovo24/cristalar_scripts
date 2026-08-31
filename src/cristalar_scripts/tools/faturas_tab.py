@@ -1,6 +1,8 @@
 """Streamlit tab: download the template, upload it filled in, run the fill."""
 
+import os
 import queue
+import sys
 from io import BytesIO
 
 import streamlit as st
@@ -8,6 +10,11 @@ import streamlit as st
 from cristalar_scripts import validar_faturas as vf
 from cristalar_scripts.async_runner import AsyncRunner
 from cristalar_scripts.criar_template import template_bytes
+
+
+def _can_show_browser() -> bool:
+    """False on a headless Linux server (e.g. Streamlit Cloud) with no X server."""
+    return sys.platform != "linux" or bool(os.environ.get("DISPLAY"))
 
 
 def _state():
@@ -117,7 +124,11 @@ def render():
     submit = st.checkbox("Really submit (Finalizar)", value=False)
     if submit:
         st.warning("This issues the invoices for real.")
-    show_browser = st.checkbox("Show browser", value=True)
+    can_show_browser = _can_show_browser()
+    show_browser = st.checkbox(
+        "Show browser", value=can_show_browser, disabled=not can_show_browser)
+    if not can_show_browser:
+        st.caption("Not available on this server (no display) — runs headless.")
     parallel_tabs = st.number_input(
         "Parallel tabs", min_value=1, value=vf.PARALLEL_TABS)
 
